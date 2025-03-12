@@ -326,8 +326,9 @@ class GaussianSplatting(Method):
 
         # todo tuning these models
         encoding_dim = 32
+        appearance_n_fourier_freqs = 4
         self.appearance_encoder = AppearanceEncoder(backbone="resnet18", output_dim=encoding_dim, pretrained=False).cuda()
-        self.appearance_transform = AppearanceTransform(global_encoding_dim=encoding_dim, local_encoding_dim=24).cuda()
+        self.appearance_transform = AppearanceTransform(global_encoding_dim=encoding_dim, local_encoding_dim=appearance_n_fourier_freqs*6).cuda()
         self.appearance_encoder_optimizer = torch.optim.Adam(self.appearance_encoder.parameters(), lr=0.0005, eps=1e-15)
         self.appearance_transform_optimizer = torch.optim.Adam(self.appearance_transform.parameters(), lr=0.0005, eps=1e-15)
 
@@ -566,7 +567,7 @@ class GaussianSplatting(Method):
 
         appearance_encoding = appearance_encoding.repeat(eval_color.size(0), 1)
         # color transform given original color, global appearance encoding and position encoding
-        override_color = self.appearance_transform(eval_color, appearance_encoding, gaussians.get_position_encoding(4))
+        override_color = self.appearance_transform(eval_color, appearance_encoding, gaussians.get_local_encoding())
         return override_color
 
     def _densification(self, iteration, gaussians, visibility_filter, radii, viewspace_point_tensor, correspond_scene):
