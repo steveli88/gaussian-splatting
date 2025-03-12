@@ -8,6 +8,7 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
+import math
 
 import torch
 import numpy as np
@@ -20,6 +21,19 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+
+
+def _get_fourier_features(xyz, num_features=3):
+    # xyz = torch.from_numpy(xyz).to(dtype=torch.float32)
+    xyz = xyz - xyz.mean(dim=0, keepdim=True)
+    xyz = xyz / torch.quantile(xyz.abs(), 0.97, dim=0) * 0.5 + 0.5
+    freqs = torch.repeat_interleave(
+        2 ** torch.linspace(0, num_features - 1, num_features, dtype=xyz.dtype, device=xyz.device), 2)
+    offsets = torch.tensor([0, 0.5 * math.pi] * num_features, dtype=xyz.dtype, device=xyz.device)
+    feat = xyz[..., None] * freqs[None, None] * 2 * math.pi + offsets[None, None]
+    feat = torch.flatten(torch.sin(feat), start_dim=1)
+    return feat
+
 
 class GaussianModel:
 
@@ -103,6 +117,9 @@ class GaussianModel:
     @property
     def get_xyz(self):
         return self._xyz
+
+    def get_position_encoding(self, num_features=3):
+        return _get_fourier_features(self._xyz, num_features)
     
     @property
     def get_features(self):
