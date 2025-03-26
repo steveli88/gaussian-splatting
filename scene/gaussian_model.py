@@ -3,13 +3,12 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
 import math
-
 import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
@@ -43,7 +42,7 @@ class GaussianModel:
             actual_covariance = L @ L.transpose(1, 2)
             symm = strip_symmetric(actual_covariance)
             return symm
-        
+
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
 
@@ -57,7 +56,7 @@ class GaussianModel:
 
     def __init__(self, sh_degree : int):
         self.active_sh_degree = 0
-        self.max_sh_degree = sh_degree  
+        self.max_sh_degree = sh_degree
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
@@ -73,7 +72,7 @@ class GaussianModel:
         self.setup_functions()
 
         # todo check local learnable encoding help
-        self.local_encoding_lr = 0.0005
+        self.local_encoding_lr = 0.005
         self.appearance_n_fourier_freqs = 4
         self._local_encoding = torch.empty(0)
 
@@ -93,19 +92,19 @@ class GaussianModel:
             self.spatial_lr_scale,
             self._local_encoding
         )
-    
+
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
+        (self.active_sh_degree,
+        self._xyz,
+        self._features_dc,
         self._features_rest,
-        self._scaling, 
-        self._rotation, 
+        self._scaling,
+        self._rotation,
         self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
+        self.max_radii2D,
+        xyz_gradient_accum,
         denom,
-        opt_dict, 
+        opt_dict,
         self.spatial_lr_scale,
         self._local_encoding) = model_args
         self.training_setup(training_args)
@@ -113,34 +112,54 @@ class GaussianModel:
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
 
+    def freeze(self):
+        self._xyz.requires_grad = False
+        self._features_dc.requires_grad = False
+        self._features_rest.requires_grad = False
+        self._opacity.requires_grad = False
+        self._scaling.requires_grad = False
+        self._rotation.requires_grad = False
+        # todo lr config for local encoding
+        self._local_encoding.requires_grad = False
+
+    def unfreeze(self):
+        self._xyz.requires_grad = True
+        self._features_dc.requires_grad = True
+        self._features_rest.requires_grad = True
+        self._opacity.requires_grad = True
+        self._scaling.requires_grad = True
+        self._rotation.requires_grad = True
+        self._local_encoding.requires_grad = True
+
     @property
     def get_scaling(self):
         return self.scaling_activation(self._scaling)
-    
+
     @property
     def get_rotation(self):
         return self.rotation_activation(self._rotation)
-    
+
     @property
     def get_xyz(self):
         return self._xyz
 
     def get_position_encoding(self, num_features=3):
         return _get_fourier_features(self._xyz, num_features)
-    
+
     @property
     def get_features(self):
         features_dc = self._features_dc
         features_rest = self._features_rest
         return torch.cat((features_dc, features_rest), dim=1)
-    
+
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
-    
+
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
+    @property
     def get_local_encoding(self):
         return self._local_encoding
 
@@ -286,7 +305,7 @@ class GaussianModel:
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
-        local_encoding_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("rot")]
+        local_encoding_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("local")]
         local_encoding_names = sorted(local_encoding_names, key = lambda x: int(x.split('_')[-1]))
         local_encoding = np.zeros((xyz.shape[0], len(local_encoding_names)))
         for idx, attr_name in enumerate(local_encoding_names):
@@ -427,7 +446,7 @@ class GaussianModel:
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
-        
+
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
@@ -457,3 +476,4 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+

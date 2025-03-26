@@ -1,38 +1,36 @@
 import math
-
 import torch
 import torch.nn as nn
 import torchvision.models as models
+import torch.nn.init as init
 
 
-class AppearanceEncoder(nn.Module):
-    def __init__(self, backbone="resnet18", output_dim=256, pretrained=True, pooling_window=3):
-        super(AppearanceEncoder, self).__init__()
+def initialize_weights(m):
+    """
+    Applies different weight initialization methods based on layer type.
+    """
+    if isinstance(m, nn.Linear):
+        init.xavier_uniform_(m.weight)  # Xavier for fully connected layers
+        if m.bias is not None:
+            init.zeros_(m.bias)  # Zero bias initialization
 
-        # Load the backbone (e.g., ResNet, EfficientNet)
-        if backbone == "resnet18":
-            self.model = models.resnet18(pretrained=pretrained)
-            feature_dim = self.model.fc.in_features
-            self.model = nn.Sequential(*list(self.model.children())[:-2])  # Remove fully connected layers
-        elif backbone == "efficientnet_b0":
-            self.model = models.efficientnet_b0(pretrained=pretrained)
-            feature_dim = self.model.classifier[1].in_features
-            self.model = nn.Sequential(*list(self.model.children())[:-2])  # Remove fully connected layers
-        else:
-            raise ValueError("Unsupported backbone: Choose 'resnet18' or 'efficientnet_b0'.")
+    elif isinstance(m, nn.Conv2d):
+        init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')  # Kaiming for conv layers
+        if m.bias is not None:
+            init.constant_(m.bias, 0)  # Zero bias
 
-        # Adaptive Pooling to handle different input sizes
-        self.global_pool = nn.AdaptiveAvgPool2d((pooling_window, pooling_window))
+    elif isinstance(m, nn.BatchNorm2d):
+        init.constant_(m.weight, 1)  # Initialize BN scale factor to 1
+        init.constant_(m.bias, 0)  # Zero bias
 
-        # Projection head for feature dimensionality reduction
-        self.fc = nn.Linear(feature_dim * pooling_window * pooling_window, output_dim)
-
-    def forward(self, x):
-        x = self.model(x)  # Feature extraction
-        x = self.global_pool(x)  # Global pooling (NxCx1x1)
-        x = torch.flatten(x, 1)  # Flatten to (NxC)
-        x = self.fc(x)  # Project to output dimension
-        return x
+    elif isinstance(m, nn.LSTM) or isinstance(m, nn.GRU):
+        for name, param in m.named_parameters():
+            if "weight_ih" in name:
+                init.xavier_uniform_(param.data)  # Xavier for input weights
+            elif "weight_hh" in name:
+                init.orthogonal_(param.data)  # Orthogonal for hidden state
+            elif "bias" in name:
+                param.data.fill_(0)  # Zero biases
 
 
 class AppearanceTransform(nn.Module):
@@ -40,29 +38,21 @@ class AppearanceTransform(nn.Module):
         super().__init__()
         self.in_dim = in_dim
 
-        self.mlp_var = nn.Sequential(
+        self.mlp = nn.Sequential(
             nn.Linear(global_encoding_dim + local_encoding_dim + in_dim, 128),
             nn.ReLU(),
             nn.Linear(128, 128),
             nn.ReLU(),
-            nn.Linear(128, in_dim),
-        )
-        
-        self.mlp_bias = nn.Sequential(
-            nn.Linear(global_encoding_dim + local_encoding_dim + in_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, in_dim),
+            nn.Linear(128, in_dim*2),
         )
 
     def forward(self, color, global_encoding, local_encoding, viewdir=None):
         del viewdir  # Viewdirs interface is kept to be compatible with prev. version
 
-        encoding_input = torch.cat((color, global_encoding, local_encoding), dim=-1)
-        var = self.mlp_var(encoding_input) # "* 0.01" in wildgaussian why?
-        bias = self.mlp_bias(encoding_input)
-        return color * var + bias
+        encoding_input = torch.cat((color, global_encoding, local_encoding), dim=-1).cuda()
+        offset, mul = torch.split(self.mlp(encoding_input), [color.shape[-1], color.shape[-1]], dim=-1)
+        mul = mul + 1
+        return color * mul + offset
 
 
 # Local encoding
@@ -79,23 +69,14 @@ def _get_fourier_features(xyz, num_features=3):
 
 
 if __name__ == "__main__":
-    encoding_dim = 64
-
     # Example usage
-    model = AppearanceEncoder(backbone="resnet18", output_dim=encoding_dim, pretrained=False).cuda()
-    input_tensor = torch.randn(1, 3, 1224, 624).cuda()  # Batch of 4 images with varying sizes
-    features = model(input_tensor)  # (4, 256)
-    print(features.shape)
-
-    # Example usage
-    appearance_transform = AppearanceTransform(global_encoding_dim=encoding_dim, local_encoding_dim=encoding_dim).cuda()
-    color = torch.randn(1000000, 3).cuda()
-    global_encoding = torch.randn(1000000, encoding_dim).cuda()
-    local_encoding = torch.randn(1000000, encoding_dim).cuda()
+    appearance_transform = AppearanceTransform(global_encoding_dim=64, local_encoding_dim=64)
+    color = torch.randn(4, 3)
+    global_encoding = torch.randn(4, 64)
+    local_encoding = torch.randn(4, 64)
     transformed_color = appearance_transform(color, global_encoding, local_encoding)
     print(transformed_color.shape)
 
-    xyz = torch.randn(1000000, 3).cuda()
-    position_encoding = _get_fourier_features(xyz, num_features=10)
+    xyz = torch.randn(100, 3)
+    position_encoding = _get_fourier_features(xyz, num_features=3)
     print(position_encoding.shape)
-

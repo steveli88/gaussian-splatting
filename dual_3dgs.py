@@ -13,6 +13,7 @@
 # It also adds support for sampling masks
 
 import dataclasses
+import math
 import warnings
 import random
 import itertools
@@ -24,7 +25,6 @@ import os
 import tempfile
 import numpy as np
 from PIL import Image
-from encoders import AppearanceTransform, AppearanceEncoder
 from nerfbaselines import (
     Method, MethodInfo, ModelInfo, RenderOutput, Cameras, camera_model_to_int, Dataset
 )
@@ -35,6 +35,8 @@ from argparse import ArgumentParser
 import torch
 from random import randint
 
+from scipy.cluster.hierarchy import single
+
 from utils.general_utils import PILtoTorch  # type: ignore
 from arguments import ModelParams, PipelineParams, OptimizationParams #  type: ignore
 from gaussian_renderer import render # type: ignore
@@ -44,11 +46,35 @@ from scene.dataset_readers import SceneInfo, getNerfppNorm, focal2fov  # type: i
 from scene.dataset_readers import CameraInfo as _old_CameraInfo  # type: ignore
 from scene.dataset_readers import storePly, fetchPly  # type: ignore
 from utils.general_utils import safe_state  # type: ignore
-from utils.graphics_utils import fov2focal  # type: ignore
+from utils.graphics_utils import fov2focal, getWorld2View2  # type: ignore
 from utils.loss_utils import l1_loss, ssim  # type: ignore
 from utils.sh_utils import SH2RGB, eval_sh  # type: ignore
 from scene import Scene, sceneLoadTypeCallbacks  # type: ignore
 from utils import camera_utils  # type: ignore
+
+from encoders import AppearanceTransform, initialize_weights
+
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+from torchvision.utils import save_image
+
+
+def convert_image_dtype(image: np.ndarray, dtype) -> np.ndarray:
+    if image.dtype == dtype:
+        return image
+    if image.dtype != np.uint8 and dtype != np.uint8:
+        return image.astype(dtype)
+    if image.dtype == np.uint8 and dtype != np.uint8:
+        return image.astype(dtype) / 255.0
+    if image.dtype != np.uint8 and dtype == np.uint8:
+        return np.clip(image * 255.0, 0, 255).astype(np.uint8)
+    raise ValueError(f"cannot convert image from {image.dtype} to {dtype}")
+
+
+def scale_grads(values, scale):
+    grad_values = values * scale
+    rest_values = values.detach() * (1 - scale)
+    return grad_values + rest_values
 
 
 def flatten_hparams(hparams, *, separator: str = "/", _prefix: str = ""):
@@ -99,13 +125,13 @@ def loadCam(args, id, cam_info, resolution_scale):
     camera.cx = cam_info.cx
     camera.cy = cam_info.cy
     camera.projection_matrix = getProjectionMatrixFromOpenCV(
-        camera.image_width, 
-        camera.image_height, 
-        camera.focal_x, 
-        camera.focal_y, 
-        camera.cx, 
-        camera.cy, 
-        camera.znear, 
+        camera.image_width,
+        camera.image_height,
+        camera.focal_x,
+        camera.focal_y,
+        camera.cx,
+        camera.cy,
+        camera.znear,
         camera.zfar).transpose(0, 1).cuda()
     camera.full_proj_transform = (camera.world_view_transform.unsqueeze(0).bmm(camera.projection_matrix.unsqueeze(0))).squeeze(0)
 
@@ -139,10 +165,10 @@ def _load_caminfo(idx, pose, intrinsics, image_name, image_size, image=None, ima
     if image is None:
         image = Image.fromarray(np.zeros((height, width, 3), dtype=np.uint8))
     return CameraInfo(
-        uid=idx, R=R, T=T, 
+        uid=idx, R=R, T=T,
         FovX=focal2fov(float(fx), float(width)),
         FovY=focal2fov(float(fy), float(height)),
-        image=image, image_path=image_path, image_name=image_name, 
+        image=image, image_path=image_path, image_name=image_name,
         width=int(width), height=int(height),
         sampling_mask=sampling_mask,
         cx=cx, cy=cy)
@@ -201,8 +227,8 @@ def _convert_dataset_to_gaussian_splatting(dataset: Optional[Dataset], tempdir: 
             sampling_mask = Image.fromarray((dataset["sampling_masks"][idx] * 255).astype(np.uint8))
 
         cam_info = _load_caminfo(
-            idx, pose, intrinsics, 
-            image_name=image_name, 
+            idx, pose, intrinsics,
+            image_name=image_name,
             image_path=image_path,
             image_size=(w, h),
             image=image,
@@ -234,15 +260,37 @@ def _convert_dataset_to_gaussian_splatting(dataset: Optional[Dataset], tempdir: 
     return scene_info
 
 
-def _merge_two_gaussians(gaussians1, gaussians2):
-    gaussians = copy.deepcopy(gaussians1)
-    gaussians._xyz = torch.cat([gaussians._xyz, gaussians2._xyz], dim=0)
-    gaussians._features_dc = torch.cat([gaussians._features_dc, gaussians2._features_dc], dim=0)
-    gaussians._features_rest = torch.cat([gaussians._features_rest, gaussians2._features_rest], dim=0)
-    gaussians._opacity = torch.cat([gaussians._opacity, gaussians2._opacity], dim=0)
-    gaussians._scaling = torch.cat([gaussians._scaling, gaussians2._scaling], dim=0)
-    gaussians._rotation = torch.cat([gaussians._rotation, gaussians2._rotation], dim=0)
-    return gaussians
+def _sample_view(viewpoint_stack, correspond_scene):
+    # Pick a random Camera
+    if not viewpoint_stack:
+        loadCam.was_called = False  # type: ignore
+        viewpoint_stack = correspond_scene.getTrainCameras().copy()
+        if any(not getattr(cam, "_patched", False) for cam in viewpoint_stack):
+            raise RuntimeError("could not patch loadCam!")
+    viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+    return viewpoint_cam
+
+
+def _pre_iteratrion(iteration, gaussians, viewpoint_stack, scene, global_encoding_list):
+    # Update learning rate
+    gaussians.update_learning_rate(iteration)
+
+    # Every 1000 its we increase the levels of SH up to a maximum degree
+    if iteration % 1000 == 0:
+        gaussians.oneupSHdegree()
+
+    # sample viewpoint
+    viewpoint_cam = _sample_view(viewpoint_stack, scene)
+    # todo check if using viewpoint_cam.uid is correct? Fix during entire training
+    global_encoding = global_encoding_list[viewpoint_cam.uid]
+
+    return viewpoint_cam, global_encoding
+
+
+def _save_heat_map(image, name, iteration):
+    image_uint8 = (image * 255).astype(np.uint8)
+    save_root = "/home/lorentz/Project/Code/gaussian-splatting/testing_w3dgs_bgate_vis_residual/residual"
+    Image.fromarray(image_uint8).save(os.path.join(save_root, f"{iteration}_{name}.png"))
 
 
 class GaussianSplatting(Method):
@@ -305,21 +353,20 @@ class GaussianSplatting(Method):
         if train_dataset is not None:
             self.gaussians_1.training_setup(self.opt)
             self.gaussians_2.training_setup(self.opt)
-        # todo rewrite this later
+        # todo later load weight
         # if train_dataset is None or self.checkpoint:
         #     info = self.get_info()
         #     loaded_step = info.get("loaded_step")
         #     assert loaded_step is not None, "Could not infer loaded step"
         #     (model_params, self.step) = torch.load(str(self.checkpoint) + f"/chkpnt-{loaded_step}.pth",
         #                                            weights_only=False)
-        #     self.gaussians_1.restore(model_params, self.opt)
+        #     self.gaussians.restore(model_params, self.opt)
 
         bg_color = [1, 1, 1] if self.dataset.white_background else [0, 0, 0]
         self.background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
         self._viewpoint_stack_1 = []
         self._viewpoint_stack_2 = []
 
-        # todo
         # self._input_points = None
         # if train_dataset is not None:
         #     self._input_points = (train_dataset["points3D_xyz"], train_dataset["points3D_rgb"])
@@ -327,10 +374,18 @@ class GaussianSplatting(Method):
         # todo tuning these models
         encoding_dim = 32
         appearance_n_fourier_freqs = 4
-        self.appearance_encoder = AppearanceEncoder(backbone="resnet18", output_dim=encoding_dim, pretrained=False).cuda()
+        # self.appearance_encoder = AppearanceEncoder(backbone="resnet18", output_dim=encoding_dim, pretrained=False).cuda()
+        # self.appearance_encoder = AppearanceEncoder(output_dim=encoding_dim).cuda()
+        # self.appearance_encoder.apply(initialize_weights)
         self.appearance_transform = AppearanceTransform(global_encoding_dim=encoding_dim, local_encoding_dim=appearance_n_fourier_freqs*6).cuda()
-        self.appearance_encoder_optimizer = torch.optim.Adam(self.appearance_encoder.parameters(), lr=0.0005, eps=1e-15)
+        self.appearance_transform.apply(initialize_weights)
+        # self.appearance_encoder_optimizer = torch.optim.Adam(self.appearance_encoder.parameters(), lr=0.0005, eps=1e-15)
         self.appearance_transform_optimizer = torch.optim.Adam(self.appearance_transform.parameters(), lr=0.0005, eps=1e-15)
+
+        self.global_encoding_1 = torch.normal(mean=0, std=0.01, size=(len(train_dataset["images"]), encoding_dim)).cuda().requires_grad_()
+        self.global_encoding_optimizer_1 = torch.optim.Adam([{'params': [self.global_encoding_1]}], lr=0.001, eps=1e-15)
+        self.global_encoding_2 = torch.normal(mean=0, std=0.01, size=(len(train_dataset["images"]), encoding_dim)).cuda().requires_grad_()
+        self.global_encoding_optimizer_2 = torch.optim.Adam([{'params': [self.global_encoding_2]}], lr=0.001, eps=1e-15)
 
     @classmethod
     def get_method_info(cls):
@@ -354,7 +409,7 @@ class GaussianSplatting(Method):
             **self.get_method_info(),
         )
 
-    def _build_scene(self, dataset, gaussian):
+    def _build_scene(self, dataset, gaussians):
         opt = copy.copy(self.dataset)
         with tempfile.TemporaryDirectory() as td:
             os.mkdir(td + "/sparse")
@@ -368,7 +423,7 @@ class GaussianSplatting(Method):
                     return _convert_dataset_to_gaussian_splatting(dataset, td, white_background=self.dataset.white_background, scale_coords=self.dataset.scale_coords)
                 sceneLoadTypeCallbacks["Colmap"] = colmap_loader
                 loaded_step = info.get("loaded_step")
-                scene = Scene(opt, gaussian, load_iteration=str(loaded_step) if dataset is None else None)
+                scene = Scene(opt, gaussians, load_iteration=str(loaded_step) if dataset is None else None)
                 # NOTE: This is a hack to match the RNG state of GS on 360 scenes
                 _tmp = list(range((len(next(iter(scene.train_cameras.values()))) + 6) // 7))
                 random.shuffle(_tmp)
@@ -382,6 +437,99 @@ class GaussianSplatting(Method):
             k: v.cpu().numpy() for k, v in output.items()
         }
 
+    def optimize_embedding(self, dataset, *, embedding):
+        device = self.gaussians_1.get_xyz.device
+        camera = dataset["cameras"].item()
+        assert np.all(camera.camera_models == camera_model_to_int("pinhole")), "Only pinhole cameras supported"
+
+        viewpoint_info = _load_caminfo(0, camera.poses, camera.intrinsics, f"{0:06d}.png", camera.image_sizes, scale_coords=self.dataset.scale_coords)
+        viewpoint_cam = loadCam(self.dataset, 0, viewpoint_info, 1.0)
+
+        if True:
+            global_encoding_np_1 = self._optimize_single_gaussian(self.gaussians_1, viewpoint_cam, dataset, device)
+            global_encoding_np_2 = self._optimize_single_gaussian(self.gaussians_2, viewpoint_cam, dataset, device)
+            return {
+                "embedding": (global_encoding_np_1, global_encoding_np_2),
+                # "metrics": {
+                #     "psnr": psnrs,
+                #     "mse": mses,
+                #     "loss": losses,
+                # }
+            }
+        else:
+            raise NotImplementedError("Trying to optimize embedding with appearance_enabled=False")
+
+    def _optimize_single_gaussian(self, gaussians, viewpoint_cam, dataset, device):
+        gaussians.freeze()
+        i = 0
+        losses, psnrs, mses = [], [], []
+
+        # todo debug
+        # global_encoding = (
+        #     torch.from_numpy(embedding).to(device) if embedding is not None else self.gaussians.get_global_encoding
+        # )
+        global_encoding_param = torch.nn.Parameter(torch.zeros_like(self.global_encoding_1[0]).to(device).requires_grad_(True))
+        # todo add this to config learning rate
+        optimizer = torch.optim.Adam([global_encoding_param], lr=0.1)
+
+        gt_image = torch.tensor(convert_image_dtype(dataset["images"][i], np.float32), dtype=torch.float32, device=device).permute(2, 0, 1)
+        gt_mask = torch.tensor(convert_image_dtype(dataset["sampling_masks"][i], np.float32), dtype=torch.float32, device=device)[..., None].permute(2, 0, 1) if dataset["sampling_masks"] is not None else None
+
+        with torch.enable_grad():
+            # todo add this to config
+            app_optim_type = 'dssim+l1'
+            loss_mult = None
+            if app_optim_type.endswith("-scaled"):
+                app_optim_type = app_optim_type[:-7]
+                # if self.model.uncertainty_model is not None:
+                #     _, _, loss_mult = self.model.uncertainty_model.get_loss(gt_image, gt_image)
+                #     loss_mult = (loss_mult > 1).to(dtype=loss_mult.dtype)
+            # todo add this to config
+            global_encoding_optim_iters = 128
+            for _ in range(global_encoding_optim_iters):
+                optimizer.zero_grad()
+
+                bg = torch.zeros((3,), dtype=torch.float32, device="cuda")
+                image = self._render_with_appearance_encoding(viewpoint_cam, gaussians, global_encoding_param, bg)["render"]
+
+                if gt_mask is not None:
+                    image = scale_grads(image, gt_mask.float())
+                if loss_mult is not None:
+                    image = scale_grads(image, loss_mult)
+
+                mse = torch.nn.functional.mse_loss(image, gt_image)
+
+                if app_optim_type == "mse":
+                    loss = mse
+                elif app_optim_type == "dssim+l1":
+                    Ll1 = torch.nn.functional.l1_loss(image, gt_image)
+                    ssim_value = ssim(image, gt_image, size_average=True)
+                    loss = (
+                            (1.0 - self.opt.lambda_dssim) * Ll1 +
+                            self.opt.lambda_dssim * (1.0 - ssim_value)
+                    )
+                else:
+                    raise ValueError(f"Unknown appearance optimization type {app_optim_type}")
+                loss.backward()
+                # TODO: use uncertainty here as well
+                # print(float(global_encoding_param.grad.abs().max().cpu()), float(mse.cpu()))
+                optimizer.step()
+
+                losses.append(loss.detach().cpu().item())
+                mses.append(mse.detach().cpu().item())
+                psnrs.append(20 * math.log10(1.0) - 10 * torch.log10(mse).detach().cpu().item())
+
+        if gaussians.optimizer is not None:
+            gaussians.optimizer.zero_grad()
+        global_encoding = global_encoding_param
+        global_encoding_np = global_encoding_param.detach().cpu().numpy()
+
+        torch.cuda.empty_cache()
+
+        gaussians.unfreeze()
+
+        return global_encoding_np
+
     def render(self, camera: Cameras, *, options=None) -> RenderOutput:
         camera = camera.item()
         assert np.all(camera.camera_models == camera_model_to_int("pinhole")), "Only pinhole cameras supported"
@@ -389,128 +537,71 @@ class GaussianSplatting(Method):
         with torch.no_grad():
             viewpoint_cam = _load_caminfo(0, camera.poses, camera.intrinsics, f"{0:06d}.png", camera.image_sizes, scale_coords=self.dataset.scale_coords)
             viewpoint = loadCam(self.dataset, 0, viewpoint_cam, 1.0)
-            # todo
-            # Appearance modeling
-            # The digit represents Gaussian model.
-            gt_image = viewpoint.original_image.unsqueeze(0).cuda()
-            appearance_encoding = self.appearance_encoder(gt_image)
-            override_color_1 = self._appearance_transform(viewpoint, self.gaussians_1, appearance_encoding)
-            override_color_2 = self._appearance_transform(viewpoint, self.gaussians_2, appearance_encoding)
 
-            # 1 Average rendering results
-            image1 = torch.clamp(render(viewpoint, self.gaussians_1, self.pipe, self.background, override_color=override_color_1)["render"], 0.0, 1.0)
-            image2 = torch.clamp(render(viewpoint, self.gaussians_2, self.pipe, self.background, override_color=override_color_2)["render"], 0.0, 1.0)
-            image = (image1 + image2) * 0.5
-            # # 2 Merge Gaussian models then render
-            # gaussians = _merge_two_gaussians(self.gaussians_1, self.gaussians_2)
-            # image = torch.clamp(render(viewpoint, gaussians, self.pipe, self.background)["render"], 0.0, 1.0)
+            if options is not None:
+                _np_embedding_1, _np_embedding_2 = (options or {}).get("embedding", None)
+            else:
+                encoding_dim = self.global_encoding_1[0].size(0)
+                _np_embedding_1= np.zeros((1, encoding_dim), dtype=np.float32)
+                _np_embedding_2= np.zeros((1, encoding_dim), dtype=np.float32)
+            global_encoding_1 = torch.from_numpy(_np_embedding_1).cuda()
+            global_encoding_2 = torch.from_numpy(_np_embedding_2).cuda()
+
+            image_1 = torch.clamp(self._render_with_appearance_encoding(viewpoint, self.gaussians_1, global_encoding_1, self.background)["render"], 0.0, 1.0)
+            image_2 = torch.clamp(self._render_with_appearance_encoding(viewpoint, self.gaussians_2, global_encoding_2, self.background)["render"], 0.0, 1.0)
+            image = (image_1 + image_2) * 0.5
             color = image.detach().permute(1, 2, 0)
             return self._format_output({"color": color}, options)
 
     def train_iteration(self, step):
         self.step = step
+        iteration = step + 1  # Gaussian Splatting is 1-indexed
         del step
-        iteration = self.step + 1 # Gaussian Splatting is 1-indexed
-        
-        self.gaussians_1.update_learning_rate(iteration)
-        self.gaussians_2.update_learning_rate(iteration)
-        
-        # Every 1000 its we increase the levels of SH up to a maximum degree
-        if iteration % 1000 == 0:
-            self.gaussians_1.oneupSHdegree()
-            self.gaussians_2.oneupSHdegree()
 
-        # sample viewpoint
-        viewpoint_cam_1 = self._sample_view(self._viewpoint_stack_1, self.scene_1)
-        viewpoint_cam_2 = self._sample_view(self._viewpoint_stack_2, self.scene_2)
-        
-        # Appearance modeling
-        # The first digit represents viewpoint,
-        # and the second digit represents Gaussian model.
-        # appearance_encoding_11 = appearance_encoding_12, appearance_encoding_22 = appearance_encoding_21
-        # Appearance encoding
-        gt_image_1 = viewpoint_cam_1.original_image.unsqueeze(0).cuda()
-        appearance_encoding_1 = self.appearance_encoder(gt_image_1)
-        gt_image_2 = viewpoint_cam_2.original_image.unsqueeze(0).cuda()
-        appearance_encoding_2 = self.appearance_encoder(gt_image_2)
-
-        override_color_111 = self._appearance_transform(viewpoint_cam_1, self.gaussians_1, appearance_encoding_1)
-        override_color_121 = self._appearance_transform(viewpoint_cam_1, self.gaussians_2, appearance_encoding_1)
-        override_color_222 = self._appearance_transform(viewpoint_cam_2, self.gaussians_2, appearance_encoding_2)
-        override_color_212 = self._appearance_transform(viewpoint_cam_2, self.gaussians_1, appearance_encoding_2)
-
-        # The first digit represents viewpoint, 
-        # and the second digit represents Gaussian model. 
-        # The third digit represents appearance. 
-        # Here, 0 is intrinsic appearance, 1 is appearance from image1, 2 is appearance from image2.
+        viewpoint_cam_1, global_encoding_1 = _pre_iteratrion(iteration, self.gaussians_1, self._viewpoint_stack_1, self.scene_1, self.global_encoding_1)
+        viewpoint_cam_2, global_encoding_2 = _pre_iteratrion(iteration, self.gaussians_2, self._viewpoint_stack_2, self.scene_2, self.global_encoding_2)
         bg = torch.rand((3), device="cuda") if self.opt.random_background else self.background
-        # render_pkg_110 = render(viewpoint_cam_1, self.gaussians_1, self.pipe, bg)
-        # render_pkg_120 = render(viewpoint_cam_1, self.gaussians_2, self.pipe, bg)
-        # render_pkg_210 = render(viewpoint_cam_2, self.gaussians_1, self.pipe, bg)
-        # render_pkg_220 = render(viewpoint_cam_2, self.gaussians_2, self.pipe, bg)
-        render_pkg_111 = render(viewpoint_cam_1, self.gaussians_1, self.pipe, bg, override_color=override_color_111)
-        render_pkg_121 = render(viewpoint_cam_1, self.gaussians_2, self.pipe, bg, override_color=override_color_121)
-        # render_pkg_121 = render(viewpoint_cam1, self.gaussians_2, self.pipe, bg, override_color=override_color_1)
-        # render_pkg_212 = render(viewpoint_cam2, self.gaussians_1, self.pipe, bg, override_color=override_color_2)
-        render_pkg_212 = render(viewpoint_cam_2, self.gaussians_1, self.pipe, bg, override_color=override_color_212)
-        render_pkg_222 = render(viewpoint_cam_2, self.gaussians_2, self.pipe, bg, override_color=override_color_222)
 
-        image_111, viewspace_point_tensor_111, visibility_filter_111, radii_111 = render_pkg_111["render"], render_pkg_111["viewspace_points"], render_pkg_111["visibility_filter"], render_pkg_111["radii"]
-        image_121, viewspace_point_tensor_121, visibility_filter_121, radii_121 = render_pkg_121["render"], render_pkg_121["viewspace_points"], render_pkg_121["visibility_filter"], render_pkg_121["radii"]
-        image_212, viewspace_point_tensor_212, visibility_filter_212, radii_212 = render_pkg_212["render"], render_pkg_212["viewspace_points"], render_pkg_212["visibility_filter"], render_pkg_212["radii"]
-        image_222, viewspace_point_tensor_222, visibility_filter_222, radii_222 = render_pkg_222["render"], render_pkg_222["viewspace_points"], render_pkg_222["visibility_filter"], render_pkg_222["radii"]
+        # Render 1
+        render_pkg_1 = self._render_with_appearance_encoding(viewpoint_cam_1, self.gaussians_1, global_encoding_1, bg)
+        image_1, viewspace_point_tensor_1, visibility_filter_1, radii_1 = render_pkg_1["render"], render_pkg_1["viewspace_points"], render_pkg_1["visibility_filter"], render_pkg_1["radii"]
 
-        # image_110, viewspace_point_tensor_110, visibility_filter_110, radii_110 = render_pkg_110["render"], render_pkg_110["viewspace_points"], render_pkg_110["visibility_filter"], render_pkg_110["radii"]
-        # image_120, viewspace_point_tensor_120, visibility_filter_120, radii_120 = render_pkg_120["render"], render_pkg_120["viewspace_points"], render_pkg_120["visibility_filter"], render_pkg_120["radii"]
-        # image_210, viewspace_point_tensor_210, visibility_filter_210, radii_210 = render_pkg_210["render"], render_pkg_210["viewspace_points"], render_pkg_210["visibility_filter"], render_pkg_210["radii"]
-        # image_220, viewspace_point_tensor_220, visibility_filter_220, radii_220 = render_pkg_220["render"], render_pkg_220["viewspace_points"], render_pkg_220["visibility_filter"], render_pkg_220["radii"]
+        render_pkg_raw_1 = render(viewpoint_cam_1, self.gaussians_1, self.pipe, bg)
+        image_raw_render_1 = render_pkg_raw_1["render"]
 
-        # Loss planning
-        # render_pkg_111 = image1
-        loss_111 = self._loss_wrapper(image_111, viewpoint_cam_1)
-        # render_pkg_121 = image1
-        loss_121 = self._loss_wrapper(image_121, viewpoint_cam_1)
-        # render_pkg_222 = image2
-        loss_222 = self._loss_wrapper(image_222, viewpoint_cam_2)
-        # render_pkg_212 = image2
-        loss_212 = self._loss_wrapper(image_212, viewpoint_cam_2)
-        # todo other losses
-        # render_pkg_110 = render_pkg_120
-        # loss_110 = self._loss(image_110, image_120)
-        # render_pkg_210 = render_pkg_220
-        # loss_210 = self._loss(image_210, image_220)
+        # Loss 1
+        gt_image_1, Ll1_1, ssim_value_1 = self._loss_wrapper(image_1, image_raw_render_1, viewpoint_cam_1)
+        loss = (1.0 - self.opt.lambda_dssim) * Ll1_1 + self.opt.lambda_dssim * (1.0 - ssim_value_1)
 
-        # appear1 != appear2
-        # self.gaussians_1 ~ self.gaussians_2, KL divergence
-        loss = loss_111 + loss_121 + loss_222 + loss_212 #+ loss_110 + loss_210
+        # Render 2
+        render_pkg_2 = self._render_with_appearance_encoding(viewpoint_cam_2, self.gaussians_2, global_encoding_2, bg)
+        image_2, viewspace_point_tensor_2, visibility_filter_2, radii_2 = render_pkg_2["render"], render_pkg_2["viewspace_points"], render_pkg_2["visibility_filter"], render_pkg_2["radii"]
+
+        render_pkg_raw_2 = render(viewpoint_cam_2, self.gaussians_2, self.pipe, bg)
+        image_raw_render_2 = render_pkg_raw_2["render"]
+
+        # Loss 2
+        gt_image_2, Ll1_2, ssim_value_2 = self._loss_wrapper(image_2, image_raw_render_2, viewpoint_cam_2)
+        loss += (1.0 - self.opt.lambda_dssim) * Ll1_2 + self.opt.lambda_dssim * (1.0 - ssim_value_2)
+
+        # cross supervision
+        loss += l1_loss(render(viewpoint_cam_2, self.gaussians_2, self.pipe, bg)["render"], render(viewpoint_cam_2, self.gaussians_1, self.pipe, bg)["render"])
+        loss += l1_loss(render(viewpoint_cam_1, self.gaussians_2, self.pipe, bg)["render"], render(viewpoint_cam_1, self.gaussians_1, self.pipe, bg)["render"])
+
         loss.backward()
 
-        # print(loss_111, loss_121, loss_222, loss_212, loss_110, loss_210)
-
         with torch.no_grad():
-            psnr_111 = self._psnr_wrapper(image_111, viewpoint_cam_1)
-            # psnr_121 = self._psnr_wrapper(image_121, viewpoint_cam_1)
-            psnr_222 = self._psnr_wrapper(image_222, viewpoint_cam_2)
-            # psnr_212 = self._psnr_wrapper(image_212, viewpoint_cam_2)
+            psnr_value_1 = 10 * torch.log10(1 / torch.mean((image_1 - gt_image_1) ** 2))
             metrics = {
-                # "l1_loss": Ll1.detach().cpu().item(),
-                "loss_111": loss_111.detach().cpu().item(),
-                "loss_121": loss_121.detach().cpu().item(),
-                "loss_222": loss_222.detach().cpu().item(),
-                "loss_212": loss_212.detach().cpu().item(),
-                # "loss_110": loss_110.detach().cpu().item(),
-                # "loss_210": loss_210.detach().cpu().item(),
-                "psnr_111": psnr_111.detach().cpu().item(),
-                # "psnr_121": psnr_121.detach().cpu().item(),
-                "psnr_222": psnr_222.detach().cpu().item(),
-                # "psnr_212": psnr_212.detach().cpu().item(),
+                "l1_loss_1": Ll1_1.detach().cpu().item(),
+                "l1_loss_2": Ll1_2.detach().cpu().item(),
                 "loss": loss.detach().cpu().item(),
-                "psnr": psnr_111.detach().cpu().item(),
+                "psnr": psnr_value_1.detach().cpu().item(),
             }
 
             # Densification
-            self._densification(iteration, self.gaussians_1, visibility_filter_111, radii_111, viewspace_point_tensor_111, self.scene_1)
-            self._densification(iteration, self.gaussians_2, visibility_filter_222, radii_222, viewspace_point_tensor_222, self.scene_2)
+            self._densification(iteration, self.gaussians_1, visibility_filter_1, radii_1, viewspace_point_tensor_1, self.scene_1)
+            self._densification(iteration, self.gaussians_2, visibility_filter_2, radii_2, viewspace_point_tensor_2, self.scene_2)
 
             # Optimizer step
             if iteration < self.opt.iterations + 1:
@@ -518,57 +609,32 @@ class GaussianSplatting(Method):
                 self.gaussians_1.optimizer.zero_grad(set_to_none=True)
                 self.gaussians_2.optimizer.step()
                 self.gaussians_2.optimizer.zero_grad(set_to_none=True)
-                self.appearance_encoder_optimizer.step()
-                self.appearance_encoder_optimizer.zero_grad(set_to_none=True)
                 self.appearance_transform_optimizer.step()
                 self.appearance_transform_optimizer.zero_grad(set_to_none=True)
+                self.global_encoding_optimizer_1.step()
+                self.global_encoding_optimizer_1.zero_grad(set_to_none=True)
+                self.global_encoding_optimizer_2.step()
+                self.global_encoding_optimizer_2.zero_grad(set_to_none=True)
+
+        torch.cuda.empty_cache()
 
         self.step = self.step + 1
         return metrics
 
-    def _loss_wrapper(self, pred_image, viewpoint_cam):
+    def _loss_wrapper(self, image_color_tuned_render, image_raw_render, viewpoint_cam):
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        sampling_mask = viewpoint_cam.sampling_mask.cuda() if viewpoint_cam.sampling_mask is not None else None
+        # sampling_mask = viewpoint_cam.sampling_mask.cuda() if viewpoint_cam.sampling_mask is not None else None
+        sampling_mask = torch.from_numpy(self.colmap_masks[viewpoint_cam.image_name]).to(gt_image.dtype).cuda()
 
         # Apply mask
         if sampling_mask is not None:
-            pred_image = pred_image * sampling_mask + (1.0 - sampling_mask) * pred_image.detach()
+            image_color_tuned_render = image_color_tuned_render * sampling_mask + (1.0 - sampling_mask) * image_color_tuned_render.detach()
 
-        return self._loss(pred_image, gt_image)
-
-    def _loss(self, pred_image, gt_image):
-        Ll1 = l1_loss(pred_image, gt_image)
-        ssim_value = ssim(pred_image, gt_image)
-        loss = (1.0 - self.opt.lambda_dssim) * Ll1 + self.opt.lambda_dssim * (1.0 - ssim_value)
-        return loss
-
-    def _psnr_wrapper(self, pred_image, viewpoint_cam):
-        gt_image = viewpoint_cam.original_image.cuda()
-        return 10 * torch.log10(1 / torch.mean((pred_image - gt_image) ** 2))
-
-    def _sample_view(self, viewpoint_stack, correspond_scene):
-        # Pick a random Camera
-        if not viewpoint_stack:
-            loadCam.was_called = False  # type: ignore
-            viewpoint_stack = correspond_scene.getTrainCameras().copy()
-            if any(not getattr(cam, "_patched", False) for cam in viewpoint_stack):
-                raise RuntimeError("could not patch loadCam!")
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
-        return viewpoint_cam
-        
-    def _appearance_transform(self, viewpoint_cam, gaussians, appearance_encoding):
-        # Evaluate color
-        shs_view = gaussians.get_features.transpose(1, 2).view(-1, 3, (gaussians.max_sh_degree + 1) ** 2)
-        dir_pp = (gaussians.get_xyz - viewpoint_cam.camera_center.repeat(gaussians.get_features.shape[0], 1))
-        dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
-        sh2rgb = eval_sh(gaussians.active_sh_degree, shs_view, dir_pp_normalized)
-        eval_color = torch.clamp_min(sh2rgb + 0.5, 0.0)
-
-        appearance_encoding = appearance_encoding.repeat(eval_color.size(0), 1)
-        # color transform given original color, global appearance encoding and position encoding
-        override_color = self.appearance_transform(eval_color, appearance_encoding, gaussians.get_local_encoding())
-        return override_color
+        Ll1 = l1_loss(image_color_tuned_render, gt_image)
+        # ssim_value = ssim(image, gt_image)
+        ssim_value = ssim(image_raw_render, gt_image)
+        return gt_image, Ll1, ssim_value
 
     def _densification(self, iteration, gaussians, visibility_filter, radii, viewspace_point_tensor, correspond_scene):
         if iteration < self.opt.densify_until_iter:
@@ -585,27 +651,32 @@ class GaussianSplatting(Method):
                     self.dataset.white_background and iteration == self.opt.densify_from_iter):
                 gaussians.reset_opacity()
 
+    # todo save two Gaussians
     def save(self, path: str):
-        self.gaussians_1.save_ply(os.path.join(str(path), f"point_cloud/iteration_{self.step}", "point_cloud1.ply"))
-        torch.save((self.gaussians_1.capture(), self.step), str(path) + f"/chkpnt-{self.step}1.pth")
-        self.gaussians_2.save_ply(os.path.join(str(path), f"point_cloud/iteration_{self.step}", "point_cloud2.ply"))
-        torch.save((self.gaussians_2.capture(), self.step), str(path) + f"/chkpnt-{self.step}2.pth")
-
+        self.gaussians_1.save_ply(os.path.join(str(path), f"point_cloud/iteration_{self.step}", "point_cloud.ply"))
+        torch.save((self.gaussians_1.capture(), self.step), str(path) + f"/chkpnt-{self.step}.pth")
         with open(str(path) + "/args.txt", "w", encoding="utf8") as f:
             f.write(" ".join(shlex.quote(x) for x in self._args_list))
 
-        torch.save((self.appearance_encoder, self.step), str(path) + f"/appearance_encoder.pth")
-        torch.save((self.appearance_transform, self.step), str(path) + f"/appearance_transform.pth")
-
     def export_gaussian_splats(self, *, options=None):
         del options
-        return {"Gaussian 1": self._export_gaussian_splats(self.gaussians_1),
-                "Gaussian 2": self._export_gaussian_splats(self.gaussians_2)}
-
-    def _export_gaussian_splats(self, gaussians):
         return dict(
-            means=gaussians.get_xyz.detach().cpu().numpy(),
-            scales=gaussians.get_scaling.detach().cpu().numpy(),
-            opacities=gaussians.get_opacity.detach().cpu().numpy(),
-            quaternions=gaussians.get_rotation.detach().cpu().numpy(),
-            spherical_harmonics=gaussians.get_features.transpose(1, 2).detach().cpu().numpy())
+            means=self.gaussians_1.get_xyz.detach().cpu().numpy(),
+            scales=self.gaussians_1.get_scaling.detach().cpu().numpy(),
+            opacities=self.gaussians_1.get_opacity.detach().cpu().numpy(),
+            quaternions=self.gaussians_1.get_rotation.detach().cpu().numpy(),
+            spherical_harmonics=self.gaussians_1.get_features.transpose(1, 2).detach().cpu().numpy())
+
+    def _render_with_appearance_encoding(self, viewpoint_cam, gaussians, global_encoding, bg):
+        # Evaluate color
+        shs_view = gaussians.get_features.transpose(1, 2).view(-1, 3, (gaussians.max_sh_degree + 1) ** 2)
+        dir_pp = (gaussians.get_xyz - viewpoint_cam.camera_center.repeat(gaussians.get_features.shape[0], 1))
+        dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
+        sh2rgb = eval_sh(gaussians.active_sh_degree, shs_view, dir_pp_normalized)
+        eval_color = torch.clamp_min(sh2rgb + 0.5, 0.0)
+
+        # color transform given appearance encodings
+        override_color = self.appearance_transform(eval_color, global_encoding.repeat(eval_color.size(0),1), gaussians.get_local_encoding).clamp(min=0.0, max=1.0)
+
+        # rendering with transformed color
+        return render(viewpoint_cam, gaussians, self.pipe, bg, override_color=override_color)
